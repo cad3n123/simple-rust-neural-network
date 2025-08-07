@@ -161,19 +161,21 @@ impl NeuralNetwork {
     /// Pure (non-destructive) mutation that returns a new network.
     #[must_use]
     pub fn mutate_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig) -> Self {
+        let mut layers = self.layers.to_vec();
         let mut new_layers = vec![];
 
         let mut input_size = self.input_size();
         let mut i = 0;
 
-        while i < self.layers.len() {
-            let layer = &self.layers[i];
-
+        while i < layers.len() {
             // Possibly insert a new layer before the current one
             if rng.gen_bool(cfg.insert_layer_chance) {
-                let inserted = Layer::new_random(input_size, layer.weights.0.shape()[1]);
-                new_layers.push(inserted);
+                let inserted = Layer::new_random(input_size, layers[i].weights.0.shape()[1]);
+                layers.insert(i, inserted);
+                i += 1;
             }
+
+            let layer = &layers[i];
 
             // Now create a mutated copy of the current layer
             let mut new_layer = layer.mutated_using(rng, cfg);
@@ -181,7 +183,7 @@ impl NeuralNetwork {
             if rng.gen_bool(cfg.add_neuron_chance) {
                 new_layer.add_neuron(rng);
 
-                if let Some(next_layer) = self.layers.get(i + 1) {
+                if let Some(next_layer) = layers.get(i + 1) {
                     let mut next_layer = next_layer.clone();
                     next_layer.add_input(rng);
                     updated_next = Some(next_layer);
@@ -193,7 +195,7 @@ impl NeuralNetwork {
 
                 if let Some(updated_next) = &mut updated_next {
                     updated_next.remove_first_input();
-                } else if let Some(next_layer) = self.layers.get(i + 1) {
+                } else if let Some(next_layer) = layers.get(i + 1) {
                     let mut next_layer = next_layer.clone();
                     next_layer.remove_first_input();
                     updated_next = Some(next_layer);
@@ -204,8 +206,7 @@ impl NeuralNetwork {
             new_layers.push(new_layer);
 
             if let Some(updated_next) = updated_next {
-                new_layers.push(updated_next);
-                i += 1;
+                layers[i + 1] = updated_next;
             }
             i += 1;
         }
