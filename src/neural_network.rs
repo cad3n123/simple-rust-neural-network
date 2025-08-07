@@ -5,6 +5,7 @@ use ndarray_rand::{
     rand_distr::{Distribution, Normal, StandardNormal},
 };
 use num_traits::{Float, FromPrimitive};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     mutate::{MutateConfig, mutate_matrix, mutate_vector},
@@ -12,23 +13,23 @@ use crate::{
     types::{Matrix, Vector},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeuralNetwork<T> {
     layers: Box<[Layer<T>]>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Layer<T> {
     weights: Weights<T>,
     biases: Biases<T>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Weights<T>(Matrix<T>);
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Biases<T>(Vector<T>);
 
 impl<T> NeuralNetwork<T>
 where
-    T: Float + FromPrimitive + ScalarOperand + 'static,
+    T: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
     StandardNormal: Distribution<T>,
 {
     #[must_use]
@@ -53,7 +54,15 @@ where
         let mut result = input.clone();
         for layer in &self.layers {
             let wx = layer.weights.0.dot(&result);
-            result = (wx + &layer.biases.0).map(Self::activation_function);
+            result = wx + &layer.biases.0;
+            #[cfg(not(feature = "rayon"))]
+            {
+                result.mapv_inplace(Self::activation_function);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                result.par_mapv_inplace(Self::activation_function);
+            }
         }
         result
     }
@@ -66,11 +75,11 @@ where
             }
         }
     }
-    fn activation_function(value: &T) -> T {
+    fn activation_function(value: T) -> T {
         value.max(T::zero())
     }
-    fn activation_derivative(value: &T) -> T {
-        if *value > T::zero() {
+    fn activation_derivative(value: T) -> T {
+        if value > T::zero() {
             T::one()
         } else {
             T::zero()
@@ -90,7 +99,15 @@ where
 
         for layer in &self.layers {
             let z = layer.weights.0.dot(&a) + &layer.biases.0;
-            let anext = z.map(Self::activation_function);
+            let mut anext = z.clone();
+            #[cfg(not(feature = "rayon"))]
+            {
+                anext.mapv_inplace(Self::activation_function);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                anext.par_mapv_inplace(Self::activation_function);
+            }
             zs.push(z);
             activations.push(anext.clone());
             a = anext;
@@ -101,8 +118,17 @@ where
         let mut delta = activations.last().unwrap() - training_datum.output.clone();
         // Chain with ReLU' at output layer
         {
-            let z_l = zs.last().unwrap();
-            delta = delta * &z_l.map(Self::activation_derivative);
+            let z_l = zs.last_mut().unwrap();
+            #[cfg(not(feature = "rayon"))]
+            {
+                z_l.mapv_inplace(Self::activation_derivative);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z_l.par_mapv_inplace(Self::activation_derivative);
+            }
+
+            delta = delta * z_l.clone();
         }
 
         // Iterate layers in reverse
@@ -125,8 +151,18 @@ where
                 // delta_prev = (W^T * delta) ⊙ ReLU'(z_{l-1})
                 let wt = self.layers[l_rev].weights.0.t().to_owned();
                 let mut delta_prev = wt.dot(&delta);
-                let z_prev = &zs[l_rev - 1];
-                delta_prev = delta_prev * &z_prev.map(Self::activation_derivative);
+                let z_prev = &mut zs[l_rev - 1];
+
+                #[cfg(not(feature = "rayon"))]
+                {
+                    z_prev.mapv_inplace(Self::activation_derivative);
+                }
+                #[cfg(feature = "rayon")]
+                {
+                    z_prev.par_mapv_inplace(Self::activation_derivative);
+                }
+
+                delta_prev = delta_prev * z_prev.clone();
                 delta = delta_prev;
             }
         }
@@ -153,7 +189,7 @@ where
 }
 impl<T> Layer<T>
 where
-    T: Float + FromPrimitive + ScalarOperand,
+    T: Float + FromPrimitive + ScalarOperand + Send + Sync,
     StandardNormal: Distribution<T>,
 {
     fn new_random(num_inputs: usize, num_outputs: usize) -> Self {

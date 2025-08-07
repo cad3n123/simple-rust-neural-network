@@ -33,7 +33,7 @@ where
 }
 pub(crate) fn mutate_matrix<T, R>(m: &Array2<T>, rng: &mut R, cfg: &MutateConfig<T>) -> Array2<T>
 where
-    T: Float + FromPrimitive + 'static,
+    T: Float + FromPrimitive + Send + Sync + 'static,
     R: Rng + ?Sized,
     StandardNormal: Distribution<T>,
 {
@@ -43,14 +43,21 @@ where
 
     if cfg.prob < 1.0 {
         let mask = Array2::random_using(shape, Bernoulli::new(cfg.prob).unwrap(), rng);
-        Zip::from(&mut out)
-            .and(&noise)
-            .and(&mask)
-            .for_each(|o, &n, &use_it| {
-                if use_it {
-                    *o = *o + n;
-                }
-            });
+        let zip = Zip::from(&mut out).and(&noise).and(&mask);
+        let for_each_closure = |o: &mut T, &n, &use_it| {
+            if use_it {
+                *o = *o + n;
+            }
+        };
+
+        #[cfg(not(feature = "rayon"))]
+        {
+            zip.for_each(for_each_closure);
+        }
+        #[cfg(feature = "rayon")]
+        {
+            zip.par_for_each(for_each_closure);
+        }
     } else {
         out = &out + &noise;
     }
@@ -59,18 +66,32 @@ where
         let reset_mask =
             Array2::random_using(shape, Bernoulli::new(cfg.reset_chance).unwrap(), rng);
         let fresh = Array2::random_using(shape, Normal::new(T::zero(), cfg.sigma).unwrap(), rng);
-        Zip::from(&mut out)
-            .and(&reset_mask)
-            .and(&fresh)
-            .for_each(|o, &rm, &f| {
-                if rm {
-                    *o = f;
-                }
-            });
+        let zip = Zip::from(&mut out).and(&reset_mask).and(&fresh);
+        let for_each_closure = |o: &mut T, &rm, &f| {
+            if rm {
+                *o = f;
+            }
+        };
+
+        #[cfg(not(feature = "rayon"))]
+        {
+            zip.for_each(for_each_closure);
+        }
+        #[cfg(feature = "rayon")]
+        {
+            zip.par_for_each(for_each_closure);
+        }
     }
 
     if let Some((lo, hi)) = cfg.clip {
-        out.mapv_inplace(|x| x.max(lo).min(hi));
+        #[cfg(not(feature = "rayon"))]
+        {
+            out.mapv_inplace(|x| x.max(lo).min(hi));
+        }
+        #[cfg(feature = "rayon")]
+        {
+            out.par_mapv_inplace(|x| x.max(lo).min(hi));
+        }
     }
 
     out
@@ -78,7 +99,7 @@ where
 
 pub(crate) fn mutate_vector<T, R>(v: &Array1<T>, rng: &mut R, cfg: &MutateConfig<T>) -> Array1<T>
 where
-    T: Float + FromPrimitive + ScalarOperand + 'static,
+    T: Float + FromPrimitive + ScalarOperand + Sync + Send + 'static,
     R: Rng + ?Sized,
     StandardNormal: Distribution<T>,
 {
@@ -87,13 +108,13 @@ where
 
     let out = if cfg.prob < 1.0 {
         let mask_b = Array1::random_using(shape, Bernoulli::new(cfg.prob).unwrap(), rng);
-        let mask = mask_b.mapv(|b| if b { T::one() } else { T::zero() });
+        let mask = mask_b.mapv_into_any(|b| if b { T::one() } else { T::zero() });
         v + &(noise * &mask)
     } else {
         v + &noise
     };
 
-    let out = if cfg.reset_chance > 0.0 {
+    let mut out = if cfg.reset_chance > 0.0 {
         let reset_mask_b =
             Array1::random_using(shape, Bernoulli::new(cfg.reset_chance).unwrap(), rng);
         let fresh = Array1::random_using(shape, Normal::new(T::zero(), cfg.sigma).unwrap(), rng);
@@ -107,8 +128,14 @@ where
     };
 
     if let Some((lo, hi)) = cfg.clip {
-        out.mapv(|x| x.max(lo).min(hi))
-    } else {
-        out
+        #[cfg(not(feature = "rayon"))]
+        {
+            out.mapv_inplace(|x| x.max(lo).min(hi));
+        }
+        #[cfg(feature = "rayon")]
+        {
+            out.par_mapv_inplace(|x| x.max(lo).min(hi));
+        }
     }
+    out
 }
