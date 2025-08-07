@@ -40,109 +40,256 @@ impl Default for MutateConfig {
         }
     }
 }
-pub(crate) fn mutate_matrix<R>(m: &Array2<Float>, rng: &mut R, cfg: &MutateConfig) -> Array2<Float>
+#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+pub fn mutate_matrix<R>(m: &Array2<Float>, rng: &mut R, cfg: &MutateConfig) -> Array2<Float>
 where
     R: Rng + ?Sized,
     StandardNormal: Distribution<Float>,
 {
     let shape = m.raw_dim();
-    let noise = Array2::random_using(shape, Normal::new(0., cfg.sigma).unwrap(), rng);
     let mut out = m.clone();
 
-    if cfg.prob < 1.0 {
-        let mask = Array2::random_using(shape, Bernoulli::new(cfg.prob).unwrap(), rng);
-        let zip = Zip::from(&mut out).and(&noise).and(&mask);
-        let for_each_closure = |o: &mut Float, &n, &use_it| {
-            if use_it {
-                *o += n;
-            }
-        };
-
-        #[cfg(not(feature = "rayon"))]
-        {
-            zip.for_each(for_each_closure);
-        }
-        #[cfg(feature = "rayon")]
-        {
-            zip.par_for_each(for_each_closure);
-        }
+    // Precompute random fields as needed
+    let noise = Array2::random_using(shape, Normal::new(0., cfg.sigma).unwrap(), rng);
+    let fresh = if cfg.reset_chance > 0.0 {
+        Some(Array2::random_using(
+            shape,
+            Normal::new(0., cfg.sigma).unwrap(),
+            rng,
+        ))
     } else {
-        out = &out + &noise;
-    }
+        None
+    };
 
-    if cfg.reset_chance > 0.0 {
-        let reset_mask =
-            Array2::random_using(shape, Bernoulli::new(cfg.reset_chance).unwrap(), rng);
-        let fresh = Array2::random_using(shape, Normal::new(0., cfg.sigma).unwrap(), rng);
-        let zip = Zip::from(&mut out).and(&reset_mask).and(&fresh);
-        let for_each_closure = |o: &mut Float, &rm, &f| {
-            if rm {
-                *o = f;
+    let mask = if cfg.prob < 1.0 {
+        Some(Array2::random_using(
+            shape,
+            Bernoulli::new(cfg.prob).unwrap(),
+            rng,
+        ))
+    } else {
+        None
+    };
+
+    let reset_mask = if cfg.reset_chance > 0.0 {
+        Some(Array2::random_using(
+            shape,
+            Bernoulli::new(cfg.reset_chance).unwrap(),
+            rng,
+        ))
+    } else {
+        None
+    };
+
+    // Single fused pass over all elements
+    let lohi = cfg.clip;
+    match (mask.as_ref(), reset_mask.as_ref(), fresh.as_ref()) {
+        (Some(mask), Some(rm), Some(fresh)) => {
+            let z = Zip::from(&mut out).and(&noise).and(mask).and(rm).and(fresh);
+            let f = |o: &mut Float, &n, &use_noise, &do_reset, &fresh_v| {
+                if do_reset {
+                    *o = fresh_v;
+                } else if use_noise {
+                    *o += n;
+                }
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
             }
-        };
-
-        #[cfg(not(feature = "rayon"))]
-        {
-            zip.for_each(for_each_closure);
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
         }
-        #[cfg(feature = "rayon")]
-        {
-            zip.par_for_each(for_each_closure);
+        (Some(mask), None, None) => {
+            let z = Zip::from(&mut out).and(&noise).and(mask);
+            let f = |o: &mut Float, &n, &use_noise| {
+                if use_noise {
+                    *o += n;
+                }
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
         }
-    }
-
-    if let Some((lo, hi)) = cfg.clip {
-        #[cfg(not(feature = "rayon"))]
-        {
-            out.mapv_inplace(|x| x.max(lo).min(hi));
+        (None, Some(rm), Some(fresh)) => {
+            let z = Zip::from(&mut out).and(&noise).and(rm).and(fresh);
+            let f = |o: &mut Float, &n, &do_reset, &fresh_v| {
+                if do_reset {
+                    *o = fresh_v;
+                } else {
+                    *o += n;
+                }
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
         }
-        #[cfg(feature = "rayon")]
-        {
-            out.par_mapv_inplace(|x| x.max(lo).min(hi));
+        _ => {
+            let z = Zip::from(&mut out).and(&noise);
+            let f = |o: &mut Float, &n| {
+                *o += n;
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
         }
     }
 
     out
 }
 
-pub(crate) fn mutate_vector<R>(v: &Array1<Float>, rng: &mut R, cfg: &MutateConfig) -> Array1<Float>
+#[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+pub fn mutate_vector<R>(v: &Array1<Float>, rng: &mut R, cfg: &MutateConfig) -> Array1<Float>
 where
     R: Rng + ?Sized,
     StandardNormal: Distribution<Float>,
 {
     let shape = v.raw_dim();
+    let mut out = v.clone();
+
+    // Precompute fields
     let noise = Array1::random_using(shape, Normal::new(0., cfg.sigma).unwrap(), rng);
-
-    let out = if cfg.prob < 1.0 {
-        let mask_b = Array1::random_using(shape, Bernoulli::new(cfg.prob).unwrap(), rng);
-        let mask = mask_b.mapv_into_any(|b| if b { 1. } else { 0. });
-        v + &(noise * &mask)
+    let fresh = if cfg.reset_chance > 0.0 {
+        Some(Array1::random_using(
+            shape,
+            Normal::new(0., cfg.sigma).unwrap(),
+            rng,
+        ))
     } else {
-        v + &noise
+        None
     };
 
-    let mut out = if cfg.reset_chance > 0.0 {
-        let reset_mask_b =
-            Array1::random_using(shape, Bernoulli::new(cfg.reset_chance).unwrap(), rng);
-        let fresh = Array1::random_using(shape, Normal::new(0., cfg.sigma).unwrap(), rng);
-        out.iter()
-            .zip(reset_mask_b.iter())
-            .zip(fresh.iter())
-            .map(|((val, &do_reset), &fresh_val)| if do_reset { fresh_val } else { *val })
-            .collect::<Array1<Float>>()
+    let mask = if cfg.prob < 1.0 {
+        Some(Array1::random_using(
+            shape,
+            Bernoulli::new(cfg.prob).unwrap(),
+            rng,
+        ))
     } else {
-        out
+        None
     };
 
-    if let Some((lo, hi)) = cfg.clip {
-        #[cfg(not(feature = "rayon"))]
-        {
-            out.mapv_inplace(|x| x.max(lo).min(hi));
+    let reset_mask = if cfg.reset_chance > 0.0 {
+        Some(Array1::random_using(
+            shape,
+            Bernoulli::new(cfg.reset_chance).unwrap(),
+            rng,
+        ))
+    } else {
+        None
+    };
+
+    // Fused element pass
+    let lohi = cfg.clip;
+    match (mask.as_ref(), reset_mask.as_ref(), fresh.as_ref()) {
+        (Some(mask), Some(rm), Some(fresh)) => {
+            let z = Zip::from(&mut out).and(&noise).and(mask).and(rm).and(fresh);
+            let f = |o: &mut Float, &n, &use_noise, &do_reset, &fresh_v| {
+                if do_reset {
+                    *o = fresh_v;
+                } else if use_noise {
+                    *o += n;
+                }
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
         }
-        #[cfg(feature = "rayon")]
-        {
-            out.par_mapv_inplace(|x| x.max(lo).min(hi));
+        (Some(mask), None, None) => {
+            let z = Zip::from(&mut out).and(&noise).and(mask);
+            let f = |o: &mut Float, &n, &use_noise| {
+                if use_noise {
+                    *o += n;
+                }
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
+        }
+        (None, Some(rm), Some(fresh)) => {
+            let z = Zip::from(&mut out).and(&noise).and(rm).and(fresh);
+            let f = |o: &mut Float, &n, &do_reset, &fresh_v| {
+                if do_reset {
+                    *o = fresh_v;
+                } else {
+                    *o += n;
+                }
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
+        }
+        _ => {
+            let z = Zip::from(&mut out).and(&noise);
+            let f = |o: &mut Float, &n| {
+                *o += n;
+                if let Some((lo, hi)) = lohi {
+                    *o = o.max(lo).min(hi);
+                }
+            };
+            #[cfg(not(feature = "rayon"))]
+            {
+                z.for_each(f);
+            }
+            #[cfg(feature = "rayon")]
+            {
+                z.par_for_each(f);
+            }
         }
     }
+
     out
 }

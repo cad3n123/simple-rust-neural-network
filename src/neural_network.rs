@@ -47,16 +47,22 @@ impl NeuralNetwork {
     #[must_use]
     pub fn run(&self, input: &Array1<Float>) -> Array1<Float> {
         let mut result = input.clone();
-        for layer in &self.layers {
-            let wx = layer.weights.0.dot(&result);
-            result = wx + &layer.biases.0;
-            #[cfg(not(feature = "rayon"))]
-            {
-                result.mapv_inplace(Self::activation_function);
-            }
-            #[cfg(feature = "rayon")]
-            {
-                result.par_mapv_inplace(Self::activation_function);
+        for (j, layer) in self.layers.iter().enumerate() {
+            let wx = layer.weights.0.dot(&result) + &layer.biases.0;
+            let is_last = j + 1 == self.layers.len();
+            if is_last {
+                result = wx; // linear output
+            } else {
+                let mut a = wx;
+                #[cfg(not(feature = "rayon"))]
+                {
+                    a.mapv_inplace(Self::activation_function);
+                }
+                #[cfg(feature = "rayon")]
+                {
+                    a.par_mapv_inplace(Self::activation_function);
+                }
+                result = a;
             }
         }
         result
@@ -65,8 +71,8 @@ impl NeuralNetwork {
         let mut rng = thread_rng();
         for _ in 0..epochs {
             training_data.shuffle(&mut rng);
-            for training_datum in training_data.clone() {
-                self.evolve_target(&training_datum);
+            for training_datum in &training_data {
+                self.evolve_target(training_datum);
             }
         }
     }
@@ -76,7 +82,8 @@ impl NeuralNetwork {
     fn activation_derivative(value: Float) -> Float {
         if value > 0. { 1. } else { 0. }
     }
-    fn evolve_target(&mut self, training_datum: &TrainingDatum<Float>) {
+    #[allow(clippy::missing_panics_doc)]
+    pub fn evolve_target(&mut self, training_datum: &TrainingDatum<Float>) {
         // Learning rate (tweak as needed or pass in)
         let lr = 1e-2;
 
@@ -88,62 +95,49 @@ impl NeuralNetwork {
         activations.push(training_datum.input.clone());
         let mut a = training_datum.input.clone();
 
-        for layer in &self.layers {
+        for (j, layer) in self.layers.iter().enumerate() {
             let z = layer.weights.0.dot(&a) + &layer.biases.0;
-            let mut anext = z.clone();
-            #[cfg(not(feature = "rayon"))]
-            {
-                anext.mapv_inplace(Self::activation_function);
-            }
-            #[cfg(feature = "rayon")]
-            {
-                anext.par_mapv_inplace(Self::activation_function);
-            }
+            let is_last = j + 1 == self.layers.len();
+            let anext = if is_last {
+                z.clone() // linear output
+            } else {
+                let mut t = z.clone();
+                #[cfg(not(feature = "rayon"))]
+                {
+                    t.mapv_inplace(Self::activation_function);
+                }
+                #[cfg(feature = "rayon")]
+                {
+                    t.par_mapv_inplace(Self::activation_function);
+                }
+                t
+            };
             zs.push(z);
             activations.push(anext.clone());
             a = anext;
         }
 
         // ---------- Backward pass ----------
-        // Loss: 0.5 * ||a_L - y||^2 -> dL/da_L = (a_L - y)
-        let mut delta = activations.last().unwrap() - training_datum.output.clone();
-        // Chain with ReLU' at output layer
-        {
-            let z_l = zs.last_mut().unwrap();
-            #[cfg(not(feature = "rayon"))]
-            {
-                z_l.mapv_inplace(Self::activation_derivative);
-            }
-            #[cfg(feature = "rayon")]
-            {
-                z_l.par_mapv_inplace(Self::activation_derivative);
-            }
-
-            delta = delta * z_l.clone();
-        }
 
         // Iterate layers in reverse
+        let mut delta = activations.last().unwrap() - training_datum.output.clone();
+
         for l_rev in (0..self.layers.len()).rev() {
             let a_prev = &activations[l_rev];
-
-            // dW = delta ⊗ a_prev
             let d_w = delta
                 .view()
-                .insert_axis(Axis(1)) // (out, 1)
-                .dot(&a_prev.view().insert_axis(Axis(0))); // (1, in) -> (out, in)
+                .insert_axis(Axis(1))
+                .dot(&a_prev.view().insert_axis(Axis(0)));
 
-            // db = delta
-            // Update params: W -= lr*dW, b -= lr*db
-            self.layers[l_rev].weights.0.scaled_add(-lr, &d_w); // W -= lr * dW
-            self.layers[l_rev].biases.0.scaled_add(-lr, &delta); // b -= lr * db
+            self.layers[l_rev].weights.0.scaled_add(-lr, &d_w);
+            self.layers[l_rev].biases.0.scaled_add(-lr, &delta);
 
-            // Prepare delta for previous layer (if any):
             if l_rev > 0 {
-                // delta_prev = (W^T * delta) ⊙ ReLU'(z_{l-1})
-                let wt = self.layers[l_rev].weights.0.t().to_owned();
+                let wt = self.layers[l_rev].weights.0.t();
                 let mut delta_prev = wt.dot(&delta);
-                let z_prev = &mut zs[l_rev - 1];
 
+                // ReLU’ for the *hidden* pre-activation z_{l-1}
+                let z_prev = &mut zs[l_rev - 1];
                 #[cfg(not(feature = "rayon"))]
                 {
                     z_prev.mapv_inplace(Self::activation_derivative);
@@ -153,7 +147,9 @@ impl NeuralNetwork {
                     z_prev.par_mapv_inplace(Self::activation_derivative);
                 }
 
-                delta_prev = delta_prev * z_prev.clone();
+                ndarray::Zip::from(&mut delta_prev)
+                    .and(&*z_prev)
+                    .for_each(|d, &g| *d *= g);
                 delta = delta_prev;
             }
         }
@@ -176,11 +172,14 @@ impl NeuralNetwork {
             }
 
             let layer = &layers[i];
+            let last_idx = layers.len().saturating_sub(1);
+            let is_output_layer = i == last_idx;
+            let is_penultimate = i + 1 == last_idx;
 
             // Now create a mutated copy of the current layer
             let mut new_layer = layer.mutated_using(rng, cfg);
             let mut updated_next = None;
-            if rng.gen_bool(cfg.add_neuron_chance) {
+            if rng.gen_bool(cfg.add_neuron_chance) && !is_penultimate && !is_output_layer {
                 new_layer.add_neuron(rng);
 
                 if let Some(next_layer) = layers.get(i + 1) {
@@ -189,8 +188,13 @@ impl NeuralNetwork {
                     updated_next = Some(next_layer);
                 }
             }
-            if new_layer.biases.0.len() > cfg.min_neurons && rng.gen_bool(cfg.delete_neuron_chance)
-            {
+
+            let can_delete_here = !is_output_layer
+                && !is_penultimate
+                && new_layer.biases.0.len() > cfg.min_neurons
+                && rng.gen_bool(cfg.delete_neuron_chance);
+
+            if can_delete_here {
                 new_layer.remove_first_neuron();
 
                 if let Some(updated_next) = &mut updated_next {
