@@ -1,37 +1,32 @@
-use ndarray::{Array1, Array2, Axis, ScalarOperand};
+use ndarray::{Array1, Array2, Axis, s};
 use ndarray_rand::{
     RandomExt,
     rand::{Rng, seq::SliceRandom, thread_rng},
-    rand_distr::{Distribution, Normal, StandardNormal},
+    rand_distr::Normal,
 };
-use num_traits::{Float, FromPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     mutate::{MutateConfig, mutate_matrix, mutate_vector},
     training_data::TrainingDatum,
-    types::{Matrix, Vector},
+    types::{Float, Matrix, Vector},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NeuralNetwork<T> {
-    layers: Box<[Layer<T>]>,
+pub struct NeuralNetwork {
+    layers: Box<[Layer]>,
+}
+#[derive(Debug, Clone, Serialize)]
+struct Layer {
+    weights: Weights,
+    biases: Biases,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Layer<T> {
-    weights: Weights<T>,
-    biases: Biases<T>,
-}
+struct Weights(Matrix<Float>);
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Weights<T>(Matrix<T>);
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Biases<T>(Vector<T>);
+struct Biases(Vector<Float>);
 
-impl<T> NeuralNetwork<T>
-where
-    T: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
-    StandardNormal: Distribution<T>,
-{
+impl NeuralNetwork {
     #[must_use]
     pub fn new(num_inputs: usize, num_outputs: usize, mut layer_shapes: Vec<usize>) -> Self {
         layer_shapes.push(num_outputs);
@@ -50,7 +45,7 @@ where
         }
     }
     #[must_use]
-    pub fn run(&self, input: &Array1<T>) -> Array1<T> {
+    pub fn run(&self, input: &Array1<Float>) -> Array1<Float> {
         let mut result = input.clone();
         for layer in &self.layers {
             let wx = layer.weights.0.dot(&result);
@@ -66,7 +61,7 @@ where
         }
         result
     }
-    pub fn train_data(&mut self, epochs: usize, mut training_data: Vec<TrainingDatum<T>>) {
+    pub fn train_data(&mut self, epochs: usize, mut training_data: Vec<TrainingDatum<Float>>) {
         let mut rng = thread_rng();
         for _ in 0..epochs {
             training_data.shuffle(&mut rng);
@@ -75,24 +70,20 @@ where
             }
         }
     }
-    fn activation_function(value: T) -> T {
-        value.max(T::zero())
+    const fn activation_function(value: Float) -> Float {
+        value.max(0.)
     }
-    fn activation_derivative(value: T) -> T {
-        if value > T::zero() {
-            T::one()
-        } else {
-            T::zero()
-        }
+    fn activation_derivative(value: Float) -> Float {
+        if value > 0. { 1. } else { 0. }
     }
-    fn evolve_target(&mut self, training_datum: &TrainingDatum<T>) {
+    fn evolve_target(&mut self, training_datum: &TrainingDatum<Float>) {
         // Learning rate (tweak as needed or pass in)
-        let lr = T::from_f64(1e-2).unwrap();
+        let lr = 1e-2;
 
         // ---------- Forward pass with caches ----------
         // a[0] = input, a[L] = output; zs[l] = pre-activation of layer l (1..=L)
-        let mut activations: Vec<Array1<T>> = Vec::with_capacity(self.layers.len() + 1);
-        let mut zs: Vec<Array1<T>> = Vec::with_capacity(self.layers.len());
+        let mut activations: Vec<Array1<Float>> = Vec::with_capacity(self.layers.len() + 1);
+        let mut zs: Vec<Array1<Float>> = Vec::with_capacity(self.layers.len());
 
         activations.push(training_datum.input.clone());
         let mut a = training_datum.input.clone();
@@ -169,36 +160,87 @@ where
     }
     /// Pure (non-destructive) mutation that returns a new network.
     #[must_use]
-    pub fn mutate_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig<T>) -> Self {
-        let layers = self
-            .layers
-            .iter()
-            .map(|ly| ly.mutated_using(rng, cfg))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+    pub fn mutate_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig) -> Self {
+        let mut new_layers = vec![];
 
-        Self { layers }
+        let mut input_size = self.input_size();
+        let mut i = 0;
+
+        while i < self.layers.len() {
+            let layer = &self.layers[i];
+
+            // Possibly insert a new layer before the current one
+            if rng.gen_bool(cfg.insert_layer_chance) {
+                let inserted = Layer::new_random(input_size, layer.weights.0.shape()[1]);
+                new_layers.push(inserted);
+            }
+
+            // Now create a mutated copy of the current layer
+            let mut new_layer = layer.mutated_using(rng, cfg);
+            let mut updated_next = None;
+            if rng.gen_bool(cfg.add_neuron_chance) {
+                new_layer.add_neuron(rng);
+
+                if let Some(next_layer) = self.layers.get(i + 1) {
+                    let mut next_layer = next_layer.clone();
+                    next_layer.add_input(rng);
+                    updated_next = Some(next_layer);
+                }
+            }
+
+            input_size = new_layer.weights.0.shape()[0];
+            new_layers.push(new_layer);
+
+            if let Some(updated_next) = updated_next {
+                new_layers.push(updated_next);
+                i += 1;
+            }
+            i += 1;
+        }
+
+        // Possibly insert a layer after the last one
+        if rng.gen_bool(cfg.insert_layer_chance) {
+            let inserted = Layer::new_random(input_size, self.output_size());
+            new_layers.push(inserted);
+        }
+
+        Self {
+            layers: new_layers.into_boxed_slice(),
+        }
     }
 
     /// Convenience: uses `thread_rng()`.
     #[must_use]
-    pub fn mutate(&self, cfg: &MutateConfig<T>) -> Self {
+    pub fn mutate(&self, cfg: &MutateConfig) -> Self {
         let mut rng = thread_rng();
         self.mutate_using(&mut rng, cfg)
     }
+    fn input_size(&self) -> usize {
+        self.layers.first().map_or(1, |l| l.weights.0.shape()[1])
+    }
+
+    fn output_size(&self) -> usize {
+        self.layers.last().map_or(1, |l| l.weights.0.shape()[0])
+    }
+
+    #[must_use]
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    #[must_use]
+    pub fn get_layer_output_sizes(&self) -> Vec<usize> {
+        self.layers.iter().map(|l| l.weights.0.shape()[0]).collect()
+    }
 }
-impl<T> Layer<T>
-where
-    T: Float + FromPrimitive + ScalarOperand + Send + Sync,
-    StandardNormal: Distribution<T>,
-{
+impl Layer {
     fn new_random(num_inputs: usize, num_outputs: usize) -> Self {
         Self {
             weights: Weights::new_random(num_inputs, num_outputs),
             biases: Biases::zeros(num_outputs),
         }
     }
-    fn mutated_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig<T>) -> Self {
+    fn mutated_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig) -> Self {
         let w = mutate_matrix(&self.weights.0, rng, cfg);
         let b = mutate_vector(&self.biases.0, rng, cfg);
         Self {
@@ -206,28 +248,66 @@ where
             biases: Biases(b),
         }
     }
+    fn add_neuron<R: Rng + ?Sized>(&mut self, rng: &mut R) {
+        let (out, inp) = self.weights.0.dim();
+
+        // Add row to weights
+        let mut new_weights = Array2::zeros((out + 1, inp));
+        new_weights.slice_mut(s![..out, ..]).assign(&self.weights.0);
+        new_weights.row_mut(out).assign(&Array1::random_using(
+            inp,
+            Normal::new(0., 0.1).unwrap(),
+            rng,
+        ));
+
+        // Add bias
+        let mut new_biases = Array1::zeros(out + 1);
+        new_biases.slice_mut(s![..out]).assign(&self.biases.0);
+        new_biases[out] = 0.; // or random
+
+        self.weights.0 = new_weights;
+        self.biases.0 = new_biases;
+    }
+    fn add_input<R: Rng + ?Sized>(&mut self, rng: &mut R) {
+        let (out, inp) = self.weights.0.dim();
+
+        let mut new_weights = Array2::zeros((out, inp + 1));
+        new_weights.slice_mut(s![.., ..inp]).assign(&self.weights.0);
+        let new_col = Array1::random_using(out, Normal::new(0., 0.1).unwrap(), rng);
+        new_weights.column_mut(inp).assign(&new_col);
+
+        self.weights.0 = new_weights;
+        // Biases unchanged
+    }
 }
-impl<T> Weights<T>
-where
-    T: Float + FromPrimitive,
-    StandardNormal: Distribution<T>,
-{
+impl<'de> Deserialize<'de> for Layer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CStructLayer {
+            weights: Weights,
+            biases: Biases,
+        }
+
+        let CStructLayer { weights, biases } = CStructLayer::deserialize(deserializer)?;
+        Ok(Self { weights, biases })
+    }
+}
+impl Weights {
     fn new_random(num_inputs: usize, num_outputs: usize) -> Self {
-        let two = T::from_f64(2.0).unwrap();
-        let n_inputs = T::from_usize(num_inputs).unwrap();
+        let two = 2.0;
+        let n_inputs = num_inputs as Float;
         let stddev = (two / n_inputs).sqrt();
 
         Self(Array2::random(
             (num_outputs, num_inputs),
-            Normal::new(T::zero(), stddev).unwrap(),
+            Normal::new(0., stddev).unwrap(),
         ))
     }
 }
-impl<T> Biases<T>
-where
-    T: Float + FromPrimitive,
-    StandardNormal: Distribution<T>,
-{
+impl Biases {
     fn zeros(shape: usize) -> Self {
         Self(Array1::zeros(shape))
     }
