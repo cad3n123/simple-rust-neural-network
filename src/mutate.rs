@@ -21,6 +21,9 @@ pub struct MutateConfig {
     pub insert_layer_chance: f64,
     /// Chance to add a neuron to an existing layer
     pub add_neuron_chance: f64,
+    /// Chance to delete a neuron to an existing layer
+    pub delete_neuron_chance: f64,
+    pub min_neurons: usize,
 }
 
 impl Default for MutateConfig {
@@ -31,7 +34,9 @@ impl Default for MutateConfig {
             clip: None,        // no clipping by default
             reset_chance: 0.0, // no resets by default
             insert_layer_chance: 0.01,
-            add_neuron_chance: 0.01,
+            add_neuron_chance: 0.02,
+            delete_neuron_chance: 0.01,
+            min_neurons: 2,
         }
     }
 }

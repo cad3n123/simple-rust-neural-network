@@ -187,6 +187,18 @@ impl NeuralNetwork {
                     updated_next = Some(next_layer);
                 }
             }
+            if new_layer.biases.0.len() > cfg.min_neurons && rng.gen_bool(cfg.delete_neuron_chance)
+            {
+                new_layer.remove_first_neuron();
+
+                if let Some(updated_next) = &mut updated_next {
+                    updated_next.remove_first_input();
+                } else if let Some(next_layer) = self.layers.get(i + 1) {
+                    let mut next_layer = next_layer.clone();
+                    next_layer.remove_first_input();
+                    updated_next = Some(next_layer);
+                }
+            }
 
             input_size = new_layer.weights.0.shape()[0];
             new_layers.push(new_layer);
@@ -277,6 +289,18 @@ impl Layer {
         new_weights.column_mut(inp).assign(&new_col);
 
         self.weights.0 = new_weights;
+        // Biases unchanged
+    }
+    fn remove_first_neuron(&mut self) {
+        // Remove first row from weights
+        self.weights.0 = self.weights.0.slice(s![1.., ..]).to_owned();
+
+        // Remove bias
+        self.biases.0 = self.biases.0.slice(s![1..]).to_owned();
+    }
+    fn remove_first_input(&mut self) {
+        // Create a new matrix without the first column
+        self.weights.0 = self.weights.0.slice(s![.., 1..]).to_owned();
         // Biases unchanged
     }
 }
