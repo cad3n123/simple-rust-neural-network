@@ -4,10 +4,11 @@ use ndarray_rand::{
     rand::Rng,
     rand_distr::{Bernoulli, Distribution, Normal, StandardNormal},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::types::Float;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MutateConfig {
     /// Stddev of Gaussian noise added to parameters.
     pub sigma: Float,

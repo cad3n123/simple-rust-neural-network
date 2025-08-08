@@ -1,20 +1,28 @@
 use std::sync::{Arc, Mutex};
 
 use ndarray_rand::rand::{Rng, SeedableRng, rngs::StdRng};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{mutate::MutateConfig, neural_network::NeuralNetwork, types::Float};
 
-pub struct Score(pub Float);
-type NNScored = (NeuralNetwork, Score);
-
+#[derive(Serialize, Deserialize)]
 pub struct NNGroup {
-    neural_networks: Box<[Arc<Mutex<NNScored>>]>,
+    #[serde(
+        deserialize_with = "deserialize_arc_mutex_box_slice",
+        serialize_with = "serialize_arc_mutex_box_slice"
+    )]
+    neural_networks: Box<[Arc<Mutex<ScoredNN>>]>,
     config: MutateConfig,
     alpha: Float,
     percent_survivors: Float,
 }
-
-type ScoredNN = (NeuralNetwork, Score);
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ScoredNN {
+    pub nn: NeuralNetwork,
+    pub score: Score,
+}
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Score(pub Float);
 
 impl Default for NNGroup {
     fn default() -> Self {
@@ -56,7 +64,7 @@ impl NNGroup {
             .map(|i| {
                 let g = self.neural_networks[i].lock().unwrap();
                 // higher score is better
-                (i, g.1.0)
+                (i, g.score.0)
             })
             .collect();
 
@@ -151,17 +159,20 @@ impl NNGroup {
             // Mutate clone
             let child = {
                 let mut parent_nn = self.neural_networks[parent_idx].lock().unwrap();
-                parent_nn.1 = Score(0.);
-                parent_nn.0.clone()
+                parent_nn.score.0 = 0.;
+                parent_nn.nn.clone()
             }
             .mutate(&self.config);
 
             // Reset score for fresh evaluation
-            let new_score = Score(0.); // or Score::zero()
+            let new_score = Score(0.);
 
             // Write back into the dead slot
             if let Ok(mut guard) = self.neural_networks[slot].lock() {
-                *guard = (child, new_score);
+                *guard = ScoredNN {
+                    nn: child,
+                    score: new_score,
+                };
             }
         }
 
@@ -173,4 +184,27 @@ impl NNGroup {
         //     }
         // }
     }
+}
+#[allow(clippy::type_complexity)]
+fn deserialize_arc_mutex_box_slice<'de, D>(
+    deserializer: D,
+) -> Result<Box<[Arc<Mutex<ScoredNN>>]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Vec<ScoredNN> = Vec::deserialize(deserializer)?;
+    let wrapped: Vec<Arc<Mutex<ScoredNN>>> =
+        raw.into_iter().map(|v| Arc::new(Mutex::new(v))).collect();
+    Ok(wrapped.into_boxed_slice())
+}
+#[allow(clippy::borrowed_box)]
+fn serialize_arc_mutex_box_slice<S>(
+    value: &Box<[Arc<Mutex<ScoredNN>>]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let tmp: Vec<ScoredNN> = value.iter().map(|a| a.lock().unwrap().clone()).collect();
+    tmp.serialize(serializer)
 }

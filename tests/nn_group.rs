@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use simple_neural_network::{
     mutate::MutateConfig,
     neural_network::NeuralNetwork,
-    nn_group::{NNGroup, Score},
+    nn_group::{NNGroup, Score, ScoredNN},
 };
 
 fn make_group(n: usize, cfg: MutateConfig, alpha: f32, percent_survivors: f32) -> NNGroup {
@@ -11,12 +11,15 @@ fn make_group(n: usize, cfg: MutateConfig, alpha: f32, percent_survivors: f32) -
     let base = NeuralNetwork::new(2, 1, vec![3]);
 
     // Give strictly positive, distinct scores so zeros after mutate() unambiguously indicate new children.
-    let nets: Vec<Arc<Mutex<(NeuralNetwork, Score)>>> = (0..n)
+    let nets: Vec<Arc<Mutex<ScoredNN>>> = (0..n)
         .map(|i| {
             let nn = base.clone();
             // Higher index -> higher score (or flip if you prefer best-first elsewhere)
             // We'll just use i as the score; it's fine since ordering happens in mutate().
-            Arc::new(Mutex::new((nn, Score(i as f32 + 1.0))))
+            Arc::new(Mutex::new(ScoredNN {
+                nn,
+                score: Score(i as f32 + 1.0),
+            }))
         })
         .collect();
 
@@ -29,7 +32,7 @@ fn count_zero_scores(group: &NNGroup) -> usize {
         .get_neural_networks()
         .iter()
         .filter_map(|arc| arc.lock().ok())
-        .filter(|mutex| mutex.1.0 == 0.0)
+        .filter(|mutex| mutex.score.0 == 0.0)
         .count()
 }
 
@@ -38,7 +41,7 @@ fn scores(group: &NNGroup) -> Vec<f32> {
     group
         .get_neural_networks()
         .iter()
-        .map(|arc| arc.lock().unwrap().1.0)
+        .map(|arc| arc.lock().unwrap().score.0)
         .collect()
 }
 
