@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use ndarray_rand::rand::{Rng, SeedableRng, rngs::StdRng};
+use ndarray_rand::rand::{self, Rng, rngs::ThreadRng};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(feature = "rayon")]
@@ -141,7 +141,7 @@ impl NNGroup {
         }
 
         // ----- 4) Sample survivors in RANK space -----
-        let mut rng = StdRng::seed_from_u64(42); // or pass rng in for real randomness
+        let mut rng = rand::thread_rng(); // or pass rng in for real randomness
         let mut survivors_rank: Vec<usize> = vec![];
 
         for (i, &prob) in probs_by_rank.iter().enumerate() {
@@ -192,7 +192,7 @@ impl NNGroup {
         let parent_weight_sum: Float = parent_weights.iter().sum();
 
         // Helper: roulette pick a survivor index in ORIGINAL index space
-        let pick_parent = |rng: &mut StdRng| -> usize {
+        let pick_parent = |rng: &mut ThreadRng| -> usize {
             let mut t = rng.r#gen::<Float>() * parent_weight_sum;
             for (j, &k) in survivors_rank.iter().enumerate() {
                 t -= parent_weights[j];
