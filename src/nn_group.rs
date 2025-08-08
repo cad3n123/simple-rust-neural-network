@@ -3,6 +3,14 @@ use std::sync::{Arc, Mutex};
 use ndarray_rand::rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[cfg(feature = "rayon")]
+use rayon::{
+    iter::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    },
+    slice::ParallelSliceMut,
+};
+
 use crate::{mutate::MutateConfig, neural_network::NeuralNetwork, types::Float};
 
 #[derive(Serialize, Deserialize)]
@@ -53,23 +61,45 @@ impl NNGroup {
     pub fn get_neural_networks(&self) -> &[Arc<Mutex<ScoredNN>>] {
         &self.neural_networks
     }
-    #[allow(clippy::missing_panics_doc)]
+    #[allow(clippy::missing_panics_doc, clippy::too_many_lines)]
     pub fn mutate(&mut self) {
         let n = self.neural_networks.len();
         if n == 0 {
             return;
         }
+        let nn_iterator;
+        #[cfg(not(feature = "rayon"))]
+        {
+            nn_iterator = self.neural_networks.iter();
+        }
+        #[cfg(feature = "rayon")]
+        {
+            nn_iterator = self.neural_networks.par_iter();
+        }
 
-        let mut scores: Vec<(usize, Float)> = (0..n)
-            .map(|i| {
-                let g = self.neural_networks[i].lock().unwrap();
-                // higher score is better
-                (i, g.score.0)
+        let mut scores: Vec<(usize, Float)> = nn_iterator
+            .enumerate()
+            .map(|(i, neural_network)| {
+                let s = {
+                    let g = neural_network.lock().unwrap();
+                    g.score.0
+                };
+                (i, s)
             })
             .collect();
 
         // ----- 1) Sort indices by score best→worst -----
-        scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().reverse());
+        let compare_closure =
+            |a: &(usize, Float), b: &(usize, Float)| a.1.partial_cmp(&b.1).unwrap().reverse();
+        #[cfg(not(feature = "rayon"))]
+        {
+            scores.sort_by(compare_closure);
+        }
+        #[cfg(feature = "rayon")]
+        {
+            scores.par_sort_unstable_by(compare_closure);
+        }
+
         let idx_best: Vec<usize> = scores.iter().map(|(i, _)| *i).collect();
 
         // ----- 2) Decide how many survive -----
@@ -81,14 +111,34 @@ impl NNGroup {
 
         // ----- 3) Exponential-by-rank weights (by position k=0..n-1) -----
         let alpha = self.alpha as Float;
-        let weights_by_rank: Vec<Float> = (0..n).map(|k| (-alpha * (k as Float)).exp()).collect();
-        let sum_w: Float = weights_by_rank.iter().sum();
+        let weights_by_rank: Vec<Float>;
+        let sum_w: Float;
+        let map_closure = |k: usize| (-alpha * (k as Float)).exp();
+
+        #[cfg(not(feature = "rayon"))]
+        {
+            weights_by_rank = (0..n).map(map_closure).collect();
+            sum_w = weights_by_rank.iter().sum();
+        }
+        #[cfg(feature = "rayon")]
+        {
+            weights_by_rank = (0..n).into_par_iter().map(map_closure).collect();
+            sum_w = weights_by_rank.par_iter().sum();
+        }
+
         // Scale to hit expected survivors
         let scale = target_survivors as Float / sum_w;
-        let probs_by_rank: Vec<Float> = weights_by_rank
-            .iter()
-            .map(|w| (w * scale).clamp(0.0, 1.0))
-            .collect();
+        let probs_by_rank: Vec<Float>;
+        let map_closure = |w: &Float| (w * scale).clamp(0.0, 1.0);
+
+        #[cfg(not(feature = "rayon"))]
+        {
+            probs_by_rank = weights_by_rank.iter().map(map_closure).collect();
+        }
+        #[cfg(feature = "rayon")]
+        {
+            probs_by_rank = weights_by_rank.par_iter().map(map_closure).collect();
+        }
 
         // ----- 4) Sample survivors in RANK space -----
         let mut rng = StdRng::seed_from_u64(42); // or pass rng in for real randomness
