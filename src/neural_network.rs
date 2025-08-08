@@ -166,7 +166,8 @@ impl NeuralNetwork {
         while i < layers.len() {
             // Possibly insert a new layer before the current one
             if rng.gen_bool(cfg.insert_layer_chance) {
-                let inserted = Layer::new_random(input_size, layers[i].weights.0.shape()[1]);
+                let out = layers[i].weights.0.shape()[1];
+                let inserted = Layer::new_near_identity(input_size, out);
                 layers.insert(i, inserted);
                 i += 1;
             }
@@ -307,6 +308,18 @@ impl Layer {
         // Create a new matrix without the first column
         self.weights.0 = self.weights.0.slice(s![.., 1..]).to_owned();
         // Biases unchanged
+    }
+    fn new_near_identity(num_inputs: usize, num_outputs: usize) -> Self {
+        let mut w = Array2::<Float>::zeros((num_outputs, num_inputs));
+        let d = num_inputs.min(num_outputs);
+        for i in 0..d {
+            w[(i, i)] = 1.0;
+        }
+        let b = Array1::<Float>::zeros(num_outputs);
+        Self {
+            weights: Weights(w),
+            biases: Biases(b),
+        }
     }
 }
 impl<'de> Deserialize<'de> for Layer {
