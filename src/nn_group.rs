@@ -158,11 +158,10 @@ impl NNGroup {
             let parent_idx = pick_parent(&mut rng);
             // Mutate clone
             let child = {
-                let mut parent_nn = self.neural_networks[parent_idx].lock().unwrap();
-                parent_nn.score.0 = 0.;
+                let parent_nn = self.neural_networks[parent_idx].lock().unwrap();
                 parent_nn.nn.clone()
             }
-            .mutate(&self.config);
+            .mutated(&self.config);
 
             // Reset score for fresh evaluation
             let new_score = Score(0.);
@@ -173,6 +172,11 @@ impl NNGroup {
                     nn: child,
                     score: new_score,
                 };
+            }
+        }
+        for &i in &survivors {
+            if let Ok(mut guard) = self.neural_networks[i].lock() {
+                guard.score = Score(0.);
             }
         }
 

@@ -228,7 +228,7 @@ impl NeuralNetwork {
 
     /// Convenience: uses `thread_rng()`.
     #[must_use]
-    pub fn mutate(&self, cfg: &MutateConfig) -> Self {
+    pub fn mutated(&self, cfg: &MutateConfig) -> Self {
         let mut rng = thread_rng();
         self.mutate_using(&mut rng, cfg)
     }
