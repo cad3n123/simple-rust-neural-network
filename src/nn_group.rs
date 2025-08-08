@@ -11,10 +11,10 @@ pub struct NNGroup {
         deserialize_with = "deserialize_arc_mutex_box_slice",
         serialize_with = "serialize_arc_mutex_box_slice"
     )]
-    neural_networks: Box<[Arc<Mutex<ScoredNN>>]>,
-    config: MutateConfig,
-    alpha: Float,
-    percent_survivors: Float,
+    pub neural_networks: Box<[Arc<Mutex<ScoredNN>>]>,
+    pub config: MutateConfig,
+    pub alpha: Float,
+    pub percent_survivors: Float,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ScoredNN {
