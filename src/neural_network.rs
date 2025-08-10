@@ -156,7 +156,7 @@ impl NeuralNetwork {
     }
     /// Pure (non-destructive) mutation that returns a new network.
     #[must_use]
-    pub fn mutate_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig) -> Self {
+    pub fn mutated_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig) -> Self {
         let mut layers = self.layers.to_vec();
         let mut new_layers = vec![];
 
@@ -166,9 +166,11 @@ impl NeuralNetwork {
         while i < layers.len() {
             // Possibly insert a new layer before the current one
             if rng.gen_bool(cfg.insert_layer_chance) {
-                let out = layers[i].weights.0.shape()[1];
-                let inserted = Layer::new_near_identity(input_size, out);
+                let out = layers[i].weights.0.shape()[1]; // next layer's input size
+                // Identity keeps parent's function intact (ReLU inputs are >= 0)
+                let inserted = Layer::new_identity(input_size, out);
                 layers.insert(i, inserted);
+                new_layers.push(layers[i].clone());
                 i += 1;
             }
 
@@ -185,7 +187,7 @@ impl NeuralNetwork {
 
                 if let Some(next_layer) = layers.get(i + 1) {
                     let mut next_layer = next_layer.clone();
-                    next_layer.add_input(rng);
+                    next_layer.add_input();
                     updated_next = Some(next_layer);
                 }
             }
@@ -216,12 +218,6 @@ impl NeuralNetwork {
             i += 1;
         }
 
-        // Possibly insert a layer after the last one
-        if rng.gen_bool(cfg.insert_layer_chance) {
-            let inserted = Layer::new_random(input_size, self.output_size());
-            new_layers.push(inserted);
-        }
-
         Self {
             layers: new_layers.into_boxed_slice(),
         }
@@ -231,14 +227,10 @@ impl NeuralNetwork {
     #[must_use]
     pub fn mutated(&self, cfg: &MutateConfig) -> Self {
         let mut rng = thread_rng();
-        self.mutate_using(&mut rng, cfg)
+        self.mutated_using(&mut rng, cfg)
     }
     fn input_size(&self) -> usize {
         self.layers.first().map_or(1, |l| l.weights.0.shape()[1])
-    }
-
-    fn output_size(&self) -> usize {
-        self.layers.last().map_or(1, |l| l.weights.0.shape()[0])
     }
 
     #[must_use]
@@ -258,6 +250,18 @@ impl Layer {
             biases: Biases::zeros(num_outputs),
         }
     }
+    fn new_identity(num_inputs: usize, num_outputs: usize) -> Self {
+        let mut w = Array2::<Float>::zeros((num_outputs, num_inputs));
+        let d = num_inputs.min(num_outputs);
+        for k in 0..d {
+            w[(k, k)] = 1.0;
+        }
+        Self {
+            weights: Weights(w),
+            biases: Biases::zeros(num_outputs),
+        }
+    }
+
     fn mutated_using<R: Rng + ?Sized>(&self, rng: &mut R, cfg: &MutateConfig) -> Self {
         let w = mutate_matrix(&self.weights.0, rng, cfg);
         let b = mutate_vector(&self.biases.0, rng, cfg);
@@ -268,34 +272,31 @@ impl Layer {
     }
     fn add_neuron<R: Rng + ?Sized>(&mut self, rng: &mut R) {
         let (out, inp) = self.weights.0.dim();
-
-        // Add row to weights
         let mut new_weights = Array2::zeros((out + 1, inp));
         new_weights.slice_mut(s![..out, ..]).assign(&self.weights.0);
-        new_weights.row_mut(out).assign(&Array1::random_using(
-            inp,
-            Normal::new(0., 0.1).unwrap(),
-            rng,
-        ));
 
-        // Add bias
+        // Incoming weights tiny (or zero). Tiny noise breaks symmetry but keeps it near no-op.
+        let row_noise = Array1::random_using(inp, Normal::new(0., 1e-3).unwrap(), rng);
+        new_weights.row_mut(out).assign(&row_noise);
+
         let mut new_biases = Array1::zeros(out + 1);
         new_biases.slice_mut(s![..out]).assign(&self.biases.0);
-        new_biases[out] = 0.; // or random
+
+        // Slightly negative to keep ReLU output at 0 until useful
+        new_biases[out] = -1e-3;
 
         self.weights.0 = new_weights;
         self.biases.0 = new_biases;
     }
-    fn add_input<R: Rng + ?Sized>(&mut self, rng: &mut R) {
+    fn add_input(&mut self) {
         let (out, inp) = self.weights.0.dim();
-
         let mut new_weights = Array2::zeros((out, inp + 1));
         new_weights.slice_mut(s![.., ..inp]).assign(&self.weights.0);
-        let new_col = Array1::random_using(out, Normal::new(0., 0.1).unwrap(), rng);
-        new_weights.column_mut(inp).assign(&new_col);
+
+        // NEW: zero column so adding an input is initially a no-op
+        new_weights.column_mut(inp).fill(0.0);
 
         self.weights.0 = new_weights;
-        // Biases unchanged
     }
     fn remove_first_neuron(&mut self) {
         // Remove first row from weights
@@ -308,18 +309,6 @@ impl Layer {
         // Create a new matrix without the first column
         self.weights.0 = self.weights.0.slice(s![.., 1..]).to_owned();
         // Biases unchanged
-    }
-    fn new_near_identity(num_inputs: usize, num_outputs: usize) -> Self {
-        let mut w = Array2::<Float>::zeros((num_outputs, num_inputs));
-        let d = num_inputs.min(num_outputs);
-        for i in 0..d {
-            w[(i, i)] = 1.0;
-        }
-        let b = Array1::<Float>::zeros(num_outputs);
-        Self {
-            weights: Weights(w),
-            biases: Biases(b),
-        }
     }
 }
 impl<'de> Deserialize<'de> for Layer {

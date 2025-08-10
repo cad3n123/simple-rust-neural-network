@@ -64,7 +64,7 @@ fn structural_mutations_add_and_remove_neurons_consistently() {
         delete_neuron_chance: 0.5,
         min_neurons: 2,
     };
-    let mutated = net.mutate_using(&mut rng, &cfg);
+    let mutated = net.mutated_using(&mut rng, &cfg);
     // Just check internal consistency: running shouldn't panic and output size preserved
     let out = mutated.run(&ndarray::array![1.0, 2.0, 3.0]);
     assert_eq!(out.len(), 2);
