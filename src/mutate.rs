@@ -29,6 +29,12 @@ pub struct MutateConfig {
 
 impl Default for MutateConfig {
     fn default() -> Self {
+        Self::const_default()
+    }
+}
+impl MutateConfig {
+    #[must_use]
+    pub const fn const_default() -> Self {
         Self {
             sigma: 0.02,
             prob: 0.30,
