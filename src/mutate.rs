@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Float;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MutateConfig {
     /// Stddev of Gaussian noise added to parameters.
     pub sigma: Float,
@@ -30,13 +30,13 @@ pub struct MutateConfig {
 impl Default for MutateConfig {
     fn default() -> Self {
         Self {
-            sigma: 0.02,       // gentle noise
-            prob: 0.25,        // mutate ~25% of params
-            clip: None,        // no clipping by default
-            reset_chance: 0.0, // no resets by default
-            insert_layer_chance: 0.01,
-            add_neuron_chance: 0.02,
-            delete_neuron_chance: 0.01,
+            sigma: 0.02,
+            prob: 0.30,
+            clip: Some((-1.0, 1.0)), // None for ReLU/linear nets
+            reset_chance: 0.001,
+            insert_layer_chance: 0.001,
+            add_neuron_chance: 0.01,
+            delete_neuron_chance: 0.005,
             min_neurons: 2,
         }
     }

@@ -166,6 +166,7 @@ impl NeuralNetwork {
         while i < layers.len() {
             // Possibly insert a new layer before the current one
             if rng.gen_bool(cfg.insert_layer_chance) {
+                println!("Adding new layer");
                 let out = layers[i].weights.0.shape()[1]; // next layer's input size
                 // Identity keeps parent's function intact (ReLU inputs are >= 0)
                 let inserted = Layer::new_identity(input_size, out);
@@ -229,7 +230,8 @@ impl NeuralNetwork {
         let mut rng = thread_rng();
         self.mutated_using(&mut rng, cfg)
     }
-    fn input_size(&self) -> usize {
+    #[must_use]
+    pub fn input_size(&self) -> usize {
         self.layers.first().map_or(1, |l| l.weights.0.shape()[1])
     }
 

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use ndarray_rand::rand::{self, Rng, rngs::ThreadRng};
+use ndarray_rand::rand::{self, Rng, seq::SliceRandom, thread_rng};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(feature = "rayon")]
@@ -31,6 +31,10 @@ pub struct ScoredNN {
 }
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Score(pub Float);
+pub struct Replacement {
+    pub child_index: usize,
+    pub parent_index: usize,
+}
 
 impl Default for NNGroup {
     fn default() -> Self {
@@ -62,100 +66,100 @@ impl NNGroup {
         &self.neural_networks
     }
     #[allow(clippy::missing_panics_doc, clippy::too_many_lines)]
-    pub fn mutate(&mut self) {
+    #[must_use]
+    pub fn plan_replacements(&self) -> (Vec<usize>, Vec<Replacement>) {
         let n = self.neural_networks.len();
         if n == 0 {
-            return;
-        }
-        let nn_iterator;
-        #[cfg(not(feature = "rayon"))]
-        {
-            nn_iterator = self.neural_networks.iter();
-        }
-        #[cfg(feature = "rayon")]
-        {
-            nn_iterator = self.neural_networks.par_iter();
+            return (Vec::new(), Vec::new());
         }
 
-        let mut scores: Vec<(usize, Float)> = nn_iterator
+        let mut rng = thread_rng();
+
+        // ----- Scores (shuffled) -----
+        #[cfg(not(feature = "rayon"))]
+        let mut scores: Vec<(usize, Float)> = self
+            .neural_networks
+            .iter()
             .enumerate()
-            .map(|(i, neural_network)| {
-                let s = {
-                    let g = neural_network.lock().unwrap();
-                    g.score.0
-                };
+            .map(|(i, nn)| {
+                let s = nn.lock().unwrap().score.0;
                 (i, s)
             })
             .collect();
 
-        // ----- 1) Sort indices by score best→worst -----
-        let compare_closure =
-            |a: &(usize, Float), b: &(usize, Float)| a.1.partial_cmp(&b.1).unwrap().reverse();
-        #[cfg(not(feature = "rayon"))]
-        {
-            scores.sort_by(compare_closure);
-        }
         #[cfg(feature = "rayon")]
-        {
-            scores.par_sort_unstable_by(compare_closure);
-        }
+        let mut scores: Vec<(usize, Float)> = self
+            .neural_networks
+            .par_iter()
+            .enumerate()
+            .map(|(i, nn)| {
+                let s = nn.lock().unwrap().score.0;
+                (i, s)
+            })
+            .collect();
+
+        scores.shuffle(&mut rng);
+
+        // ----- Sort best→worst -----
+        let cmp = |a: &(usize, Float), b: &(usize, Float)| a.1.partial_cmp(&b.1).unwrap().reverse();
+
+        #[cfg(not(feature = "rayon"))]
+        scores.sort_unstable_by(cmp);
+        #[cfg(feature = "rayon")]
+        scores.par_sort_unstable_by(cmp);
 
         let idx_best: Vec<usize> = scores.iter().map(|(i, _)| *i).collect();
 
-        // ----- 2) Decide how many survive -----
+        // ----- Target survivors -----
         let target_survivors = {
             #[allow(clippy::cast_sign_loss)]
             let m = (self.percent_survivors as Float * n as Float).round() as usize;
-            m.max(1).min(n) // <- was .min(1); use .max(1)
+            m.max(1).min(n)
         };
 
-        // ----- 3) Exponential-by-rank weights (by position k=0..n-1) -----
+        // ----- Rank weights w_k = exp(-alpha * k) -----
         let alpha = self.alpha as Float;
-        let weights_by_rank: Vec<Float>;
-        let sum_w: Float;
-        let map_closure = |k: usize| (-alpha * (k as Float)).exp();
 
         #[cfg(not(feature = "rayon"))]
-        {
-            weights_by_rank = (0..n).map(map_closure).collect();
-            sum_w = weights_by_rank.iter().sum();
-        }
+        let weights_by_rank: Vec<Float> = (0..n).map(|k| (-alpha * (k as Float)).exp()).collect();
         #[cfg(feature = "rayon")]
-        {
-            weights_by_rank = (0..n).into_par_iter().map(map_closure).collect();
-            sum_w = weights_by_rank.par_iter().sum();
-        }
+        let weights_by_rank: Vec<Float> = (0..n)
+            .into_par_iter()
+            .map(|k| (-alpha * (k as Float)).exp())
+            .collect();
 
-        // Scale to hit expected survivors
+        #[cfg(not(feature = "rayon"))]
+        let sum_w: Float = weights_by_rank.iter().sum();
+        #[cfg(feature = "rayon")]
+        let sum_w: Float = weights_by_rank.par_iter().sum();
+
+        // Scale to match expected survivors
         let scale = target_survivors as Float / sum_w;
-        let probs_by_rank: Vec<Float>;
-        let map_closure = |w: &Float| (w * scale).clamp(0.0, 1.0);
 
         #[cfg(not(feature = "rayon"))]
-        {
-            probs_by_rank = weights_by_rank.iter().map(map_closure).collect();
-        }
+        let probs_by_rank: Vec<Float> = weights_by_rank
+            .iter()
+            .map(|w| (w * scale).clamp(0.0, 1.0))
+            .collect();
         #[cfg(feature = "rayon")]
-        {
-            probs_by_rank = weights_by_rank.par_iter().map(map_closure).collect();
-        }
+        let probs_by_rank: Vec<Float> = weights_by_rank
+            .par_iter()
+            .map(|w| (w * scale).clamp(0.0, 1.0))
+            .collect();
 
-        // ----- 4) Sample survivors in RANK space -----
-        let mut rng = rand::thread_rng(); // or pass rng in for real randomness
-        let mut survivors_rank: Vec<usize> = vec![];
-
-        for (i, &prob) in probs_by_rank.iter().enumerate() {
-            if rng.gen_bool(f64::from(prob)) {
-                survivors_rank.push(i);
+        // ----- Sample survivors in rank space -----
+        let mut survivors_rank: Vec<usize> = Vec::new();
+        for (k, &p) in probs_by_rank.iter().enumerate() {
+            if rng.gen_bool(f64::from(p)) {
+                survivors_rank.push(k);
             }
         }
 
-        // Adjust to exactly target_survivors (fill or trim) using roulette on weights
+        // Adjust to exactly target_survivors
         match survivors_rank.len().cmp(&target_survivors) {
             std::cmp::Ordering::Less => {
                 let mut pool: Vec<usize> = (0..n).filter(|k| !survivors_rank.contains(k)).collect();
                 while survivors_rank.len() < target_survivors && !pool.is_empty() {
-                    // roulette on weights_by_rank
                     let total: Float = pool.iter().map(|&k| weights_by_rank[k]).sum();
                     let mut t = rng.r#gen::<Float>() * total;
                     let mut picked_pos = 0usize;
@@ -169,30 +173,29 @@ impl NNGroup {
                     survivors_rank.push(pool.remove(picked_pos));
                 }
             }
-            std::cmp::Ordering::Equal => {}
             std::cmp::Ordering::Greater => {
-                // drop lowest-weight survivors first
                 survivors_rank
                     .sort_by(|&a, &b| weights_by_rank[b].partial_cmp(&weights_by_rank[a]).unwrap());
                 survivors_rank.truncate(target_survivors);
             }
+            std::cmp::Ordering::Equal => {}
         }
 
-        // Convert survivors from RANK space → ORIGINAL indices
-        survivors_rank.sort_unstable(); // sort k so we can iterate cleanly
+        // Map rank→original
+        survivors_rank.sort_unstable();
         let survivors: Vec<usize> = survivors_rank.iter().map(|&k| idx_best[k]).collect();
 
-        // ----- 5) Build replacement list (dead slots) -----
+        // Dead slots are everything not in survivors
         let survivor_set: std::collections::HashSet<usize> = survivors.iter().copied().collect();
         let dead: Vec<usize> = (0..n).filter(|i| !survivor_set.contains(i)).collect();
 
-        // Parent selection weights *for survivors only* (still rank-based)
+        // Parent selection weights (for survivors only)
         let parent_weights: Vec<Float> =
             survivors_rank.iter().map(|&k| weights_by_rank[k]).collect();
         let parent_weight_sum: Float = parent_weights.iter().sum();
 
-        // Helper: roulette pick a survivor index in ORIGINAL index space
-        let pick_parent = |rng: &mut ThreadRng| -> usize {
+        // Roulette parent picker over survivors_rank
+        let pick_parent = |rng: &mut rand::rngs::ThreadRng| -> usize {
             let mut t = rng.r#gen::<Float>() * parent_weight_sum;
             for (j, &k) in survivors_rank.iter().enumerate() {
                 t -= parent_weights[j];
@@ -203,40 +206,53 @@ impl NNGroup {
             idx_best[*survivors_rank.last().unwrap()]
         };
 
-        // ----- 6) Replace dead with mutated clones of survivors -----
-        for slot in dead {
-            let parent_idx = pick_parent(&mut rng);
-            // Mutate clone
+        // Build the plan: (dead_slot, parent_idx)
+        let mut plan: Vec<Replacement> = Vec::with_capacity(dead.len());
+        for child_index in dead {
+            let parent_index = pick_parent(&mut rng);
+            plan.push(Replacement {
+                child_index,
+                parent_index,
+            });
+        }
+
+        (survivors, plan)
+    }
+
+    /// Step 2: apply replacements.
+    /// Uses the plan to write mutated children and resets survivor scores.
+    #[allow(clippy::missing_panics_doc)]
+    pub fn mutate_with_plan(&mut self, plan: &[Replacement], survivors: &[usize]) {
+        // Replace each dead slot with a mutated clone of its parent
+        for &Replacement {
+            child_index,
+            parent_index,
+        } in plan
+        {
             let child = {
-                let parent_nn = self.neural_networks[parent_idx].lock().unwrap();
+                let parent_nn = self.neural_networks[parent_index].lock().unwrap();
                 parent_nn.nn.clone()
             }
             .mutated(&self.config);
 
-            // Reset score for fresh evaluation
-            let new_score = Score(0.);
-
-            // Write back into the dead slot
-            if let Ok(mut guard) = self.neural_networks[slot].lock() {
+            if let Ok(mut guard) = self.neural_networks[child_index].lock() {
                 *guard = ScoredNN {
                     nn: child,
-                    score: new_score,
+                    score: Score(0.0),
                 };
             }
         }
-        for &i in &survivors {
+
+        // Reset scores of survivors for fresh evaluation
+        for &i in survivors {
             if let Ok(mut guard) = self.neural_networks[i].lock() {
-                guard.score = Score(0.);
+                guard.score = Score(0.0);
             }
         }
-
-        // (Optional) If you want survivors physically compacted at the front:
-        // for (dst, &src) in (0..survivors.len()).zip(survivors.iter()) {
-        //     if dst != src {
-        //         let clone_pair = self.neural_networks[src].lock().unwrap().clone();
-        //         *self.neural_networks[dst].lock().unwrap() = clone_pair;
-        //     }
-        // }
+    }
+    pub fn mutate(&mut self) {
+        let (survivors, plan) = self.plan_replacements();
+        self.mutate_with_plan(&plan, &survivors);
     }
 }
 #[allow(clippy::type_complexity)]
